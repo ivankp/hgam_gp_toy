@@ -52,8 +52,6 @@ int main(int argc, char* argv[]) {
   TEST(seed)
   std::mt19937 gen(seed);
 
-  hist h({55,105,160});
-
   const auto& bkg = in["bkg"];
   const auto& sig = in["sig"];
 
@@ -67,17 +65,20 @@ int main(int argc, char* argv[]) {
     return e ? std::exp(p) : p;
   };
 
-  const double bkg_a = bkg["a"];
-  const double bkg_b = bkg["b"];
+  const double bkg_min = bkg["min"];
+  const double bkg_max = bkg["max"];
   const size_t bkg_n = bkg["n"];
-  // const double sig_a = sig["a"];
-  // const double sig_b = sig["b"];
+  // const double sig_min = sig["min"];
+  // const double sig_max = sig["max"];
   // const size_t sig_n = sig["n"];
+  const auto& fit = in["fit"];
 
   // Monte Carlo ====================================================
   std::uniform_real_distribution<double>
-    dist_x(bkg_a,bkg_b),
-    dist_y(0,bkg_f(bkg_a));
+    dist_x(bkg_min,bkg_max),
+    dist_y(0,bkg_f(bkg_min));
+
+  hist h({fit["nbins"],bkg_min,bkg_max});
 
   vector<double> mc(bkg_n);
   TEST(bkg_n)
@@ -131,7 +132,6 @@ int main(int argc, char* argv[]) {
   cout << endl;
 
   // Likelihood fit =================================================
-  const auto& fit = in["fit"];
   auto mLogL = make_minuit(2,
     [&](const double* c) -> double {
       long double logl = 0.;
