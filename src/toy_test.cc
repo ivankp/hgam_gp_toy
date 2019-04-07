@@ -6,6 +6,8 @@
 #include <TMinuit.h>
 #include <TFile.h>
 #include <TH1.h>
+#include <TF1.h>
+// #include <TRandom3.h>
 
 #include "ivanp/enumerate.hh"
 #include "ivanp/time_seed.hh"
@@ -52,10 +54,22 @@ int main(int argc, char* argv[]) {
   TEST(seed)
   std::mt19937 gen(seed);
 
-  const auto& bkg = in["bkg"];
-  const auto& sig = in["sig"];
+  const std::array<double,2> range = in["range"];
 
-  auto bkg_f = [
+  const auto& bkg = in["bkg"];
+  const size_t bkg_n = bkg["n"];
+
+  const auto& sig = in["sig"];
+  const size_t sig_n = sig["n"];
+
+  const auto& fit = in["fit"];
+
+  // Monte Carlo ====================================================
+  vector<double> mc(bkg_n+sig_n);
+  hist h({fit["nbins"],range[0],range[1]});
+
+  // background -----------------------------------------------------
+  auto bkg_f = [ // polynomial or exp(poly)
     c = bkg["poly"].get<vector<double>>(),
     e = (bool) bkg["exp"]
   ](double x){
@@ -65,27 +79,55 @@ int main(int argc, char* argv[]) {
     return e ? std::exp(p) : p;
   };
 
-  const double bkg_min = bkg["min"];
-  const double bkg_max = bkg["max"];
-  const size_t bkg_n = bkg["n"];
-  // const double sig_min = sig["min"];
-  // const double sig_max = sig["max"];
-  // const size_t sig_n = sig["n"];
-  const auto& fit = in["fit"];
-
-  // Monte Carlo ====================================================
-  std::uniform_real_distribution<double>
-    dist_x(bkg_min,bkg_max),
-    dist_y(0,bkg_f(bkg_min));
-
-  hist h({fit["nbins"],bkg_min,bkg_max});
-
-  vector<double> mc(bkg_n);
   TEST(bkg_n)
-  for (size_t i=0; i<bkg_n; ) {
-    const double x = dist_x(gen);
-    if (dist_y(gen) < bkg_f(x)) { h(mc[i] = x); ++i; }
+  { std::uniform_real_distribution<double>
+      dist_x(range[0],range[1]),
+      dist_y(0,bkg_f(range[0]));
+    for (size_t i=0; i<bkg_n; ) {
+      const double x = dist_x(gen);
+      if (dist_y(gen) < bkg_f(x)) { h(mc[i] = x); ++i; }
+    }
   }
+
+  // signal ---------------------------------------------------------
+  auto sig_f = [ // Double-sided Crystal Ball
+    muCB  = sig["muCB" ].get<double>(),
+    sCB   = sig["sCB"  ].get<double>(),
+    aLow  = sig["aLow" ].get<double>(),
+    nLow  = sig["nLow" ].get<double>(),
+    aHigh = sig["aHigh"].get<double>(),
+    nHigh = sig["nHigh"].get<double>(),
+    n = 0
+  ](double x) mutable {
+    const double t = (x-muCB)/sCB;
+    if (t < -aLow) {
+      const double RLow = nLow/aLow;
+      return std::exp(-0.5*aLow*aLow)
+        * std::pow( (RLow - aLow - t)/RLow, -nLow );
+    }
+    if (t > aHigh) {
+      const double RHigh = nHigh/aHigh;
+      return std::exp(-0.5*aHigh*aHigh)
+        * std::pow( (RHigh - aHigh + t)/RHigh, -nHigh );
+    }
+    return std::exp(-0.5*t*t);
+  };
+
+  TEST(sig_n)
+  { std::uniform_real_distribution<double>
+      dist_x(range[0],range[1]),
+      dist_y(0,1);
+    for (size_t i=bkg_n, n=bkg_n+sig_n; i<n; ) {
+      const double x = dist_x(gen);
+      if (dist_y(gen) < sig_f(x)) { h(mc[i] = x); ++i; }
+    }
+  }
+  /*{ TRandom3 r;
+    for (size_t i=bkg_n, n=bkg_n+sig_n; i<n; ) {
+      const double x = r.Uniform(bkg_min,bkg_max);
+      if (r.Uniform() < sig_f(x)) { h(mc[i] = x); ++i; }
+    }
+  }*/
 
   // Weighted Least Squares =========================================
   std::array<double(*)(double),3> fs {
@@ -166,5 +208,15 @@ int main(int argc, char* argv[]) {
 
   TFile fout("toy_test.root","recreate");
   to_root("first_toy",h);
+
+  TF1 *fbkg =
+   new TF1("bkg",[&](double* x, double*){ return bkg_f(*x); },105,160,0);
+  TF1 *fsig =
+   new TF1("sig",[&](double* x, double*){ return sig_f(*x); },105,160,0);
+  fbkg->SetNpx(10000);
+  fsig->SetNpx(10000);
+  fbkg->Write();
+  fsig->Write();
+
   fout.Write();
 }
