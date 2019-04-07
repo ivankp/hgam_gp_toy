@@ -1,0 +1,14 @@
+/*
+
+!.gitignore
+!.gitmodules
+!Makefile
+!README*
+!include/
+!src/
+
+!ivanplib
+
+!run.sh
+
+**.swp

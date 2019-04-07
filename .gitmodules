@@ -1,0 +1,3 @@
+[submodule "ivanplib"]
+	path = ivanplib
+	url = https://github.com/ivankp/ivanplib
