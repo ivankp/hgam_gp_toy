@@ -7,7 +7,6 @@
 #include <TFile.h>
 #include <TH1.h>
 #include <TF1.h>
-// #include <TRandom3.h>
 
 #include "ivanp/enumerate.hh"
 #include "ivanp/time_seed.hh"
@@ -39,8 +38,9 @@ TH1D* to_root(const char* name, const hist& h) {
   const unsigned n = axis.nbins();
   TH1D* _h = new TH1D(name, "", n, axis.min(), axis.max());
   auto* val = dynamic_cast<TArrayD*>(_h)->GetArray() + 1;
+  const auto& bins = h.bins();
   for (unsigned i=0; i<n; ++i)
-    val[i] = h[{i}];
+    val[i] = bins[i];
   return _h;
 }
 
@@ -96,9 +96,8 @@ int main(int argc, char* argv[]) {
     aLow  = sig["aLow" ].get<double>(),
     nLow  = sig["nLow" ].get<double>(),
     aHigh = sig["aHigh"].get<double>(),
-    nHigh = sig["nHigh"].get<double>(),
-    n = 0
-  ](double x) mutable {
+    nHigh = sig["nHigh"].get<double>()
+  ](double x) {
     const double t = (x-muCB)/sCB;
     if (t < -aLow) {
       const double RLow = nLow/aLow;
@@ -122,56 +121,51 @@ int main(int argc, char* argv[]) {
       if (dist_y(gen) < sig_f(x)) { h(mc[i] = x); ++i; }
     }
   }
-  /*{ TRandom3 r;
-    for (size_t i=bkg_n, n=bkg_n+sig_n; i<n; ) {
-      const double x = r.Uniform(bkg_min,bkg_max);
-      if (r.Uniform() < sig_f(x)) { h(mc[i] = x); ++i; }
-    }
-  }*/
 
   // Weighted Least Squares =========================================
-  std::array<double(*)(double),3> fs {
-    [](double x){ return 1.;  },
-    [](double x){ return x;   },
-    [](double x){ return x*x; }
-  };
-
   const auto& axis = h.axis();
   const auto nbins = axis.nbins();
-  std::vector<double> A;
-  A.reserve(fs.size()*nbins);
-  for (auto& f : fs) {
-    double a = axis.edge(0), b;
-    for (unsigned i=0; i<nbins; ) {
-      ++i;
-      b = axis.edge(i);
-      A.push_back(f(a+(b-a)/2));
-      a = b;
+  constexpr size_t nfs = 3;
+  std::array<double,nfs> wls_cs;
+  {
+    std::vector<double> A;
+    A.reserve(nfs*nbins);
+    for (auto& f : { // unary + decays lambdas to function pointers
+      +[](double x){ return 1.;  },
+      +[](double x){ return x;   },
+      +[](double x){ return x*x; }
+    }) {
+      double a = axis.edge(0), b;
+      for (unsigned i=0; i<nbins; ) {
+        ++i;
+        b = axis.edge(i);
+        A.push_back(f(a+(b-a)/2));
+        a = b;
+      }
     }
-  }
-  std::vector<double> us;
-  us.reserve(nbins);
-  for (double y : h) us.push_back(y==0 ? 1 : y);
+    std::vector<double> us;
+    us.reserve(nbins);
+    for (double y : h) us.push_back(y==0 ? 1 : y);
 
-  std::array<double,fs.size()> wls_cs;
-  wls(
-    A.data(),
-    h.bins().data(), // observed values
-    us.data(), // variances
-    nbins, // number of values
-    fs.size(), // number of parameters
-    wls_cs.data() // fit coefficients
-  );
-  cout << "WLS:\n";
-  for (auto c : wls_cs) cout << ' ' << c;
-  cout << "\nNormalized coefficients:\n";
-  const double norm = 1./(
-      55.*wls_cs[0]
-    + (14575./2.)*wls_cs[1]
-    + (2938375./3.)*wls_cs[2]
-  );
-  for (auto& c : wls_cs) cout << ' ' << (c*=norm);
-  cout << endl;
+    wls(
+      A.data(),
+      h.bins().data(), // observed values
+      us.data(), // variances
+      nbins, // number of values
+      nfs, // number of parameters
+      wls_cs.data() // fit coefficients
+    );
+    cout << "WLS:\n";
+    for (auto c : wls_cs) cout << ' ' << c;
+    cout << "\nNormalized coefficients:\n";
+    const double norm = 1./(
+        55.*wls_cs[0]
+      + (14575./2.)*wls_cs[1]
+      + (2938375./3.)*wls_cs[2]
+    );
+    for (auto& c : wls_cs) cout << ' ' << (c*=norm);
+    cout << endl;
+  }
 
   // Likelihood fit =================================================
   auto mLogL = make_minuit(2,
@@ -206,6 +200,7 @@ int main(int argc, char* argv[]) {
   }
   cout << endl;
 
+  // Save output ====================================================
   TFile fout("toy_test.root","recreate");
   to_root("first_toy",h);
 
@@ -213,8 +208,8 @@ int main(int argc, char* argv[]) {
    new TF1("bkg",[&](double* x, double*){ return bkg_f(*x); },105,160,0);
   TF1 *fsig =
    new TF1("sig",[&](double* x, double*){ return sig_f(*x); },105,160,0);
-  fbkg->SetNpx(10000);
-  fsig->SetNpx(10000);
+  fbkg->SetNpx(1000);
+  fsig->SetNpx(1000);
   fbkg->Write();
   fsig->Write();
 
