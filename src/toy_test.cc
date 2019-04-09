@@ -2,7 +2,10 @@
 #include <vector>
 #include <cmath>
 
+#include <boost/optional.hpp>
+
 #include <nlohmann/json.hpp>
+#include "json/boost_optional.hh"
 
 #include <TMinuit.h>
 #include <TFile.h>
@@ -12,10 +15,12 @@
 #include "ivanp/time_seed.hh"
 #include "ivanp/binner.hh"
 #include "ivanp/string.hh"
+#include "ivanp/timed_counter.hh"
 #include "ivanp/root/minuit.hh"
 
 #include "wls.hh"
 #include "gp.hh"
+#include "integration.hh"
 
 #define TEST(var) \
   std::cout << "\033[36m" #var "\033[0m = " << var << std::endl;
@@ -25,6 +30,7 @@ constexpr double sqrt_1_2 = M_SQRT1_2;
 
 using std::cout;
 using std::endl;
+using std::get;
 using std::string;
 using std::vector;
 using nlohmann::json;
@@ -75,6 +81,9 @@ int main(int argc, char* argv[]) {
   const auto& sig = in["sig"];
   const size_t sig_n = sig["n"];
 
+  const double sig_frac = double(sig_n)/double(bkg_n+sig_n);
+  TEST(sig_frac)
+
   const auto& fit = in["fit"];
 
   // Monte Carlo ====================================================
@@ -103,39 +112,38 @@ int main(int argc, char* argv[]) {
   }
 
   // signal ---------------------------------------------------------
-  struct DSCB_params_t {
+  struct DSCB_t { // Double-sided Crystal Ball
     double mu, s, aL, nL, rL, eL, aH, nH, rH, eH, norm;
-    DSCB_params_t(const json& sig, const std::array<double,2>& range)
+    DSCB_t(const json& sig, const std::array<double,2>& range)
     : mu(sig.at("muCB")), s(sig.at("sCB")),
       aL(sig.at("aLow" )), nL(sig.at("nLow" )), rL(nL/aL), eL(std::exp(-0.5*aL*aL)),
       aH(sig.at("aHigh")), nH(sig.at("nHigh")), rH(nH/aH), eH(std::exp(-0.5*aH*aH))
     {
-      // norm = 1. / ( // infinite tails
-      //     eL * rL / (nL-1)
-      //   + eH * rH / (nH-1)
-      //   + sqrt_pi_2 * (std::erf(aH*sqrt_1_2) - std::erf(aL*sqrt_1_2))
-      // );
-
       const double gL = (mu-range[0])/s + rL - aL;
       const double gH = (range[1]-mu)/s + rL - aL;
-      norm = 1. / (
+      norm = 1. / ( s * ( // σ from the Jacobian
           eL * (rL - std::pow(rL/gL,nL)*gL) / (nL-1)
         + eH * (rH - std::pow(rH/gH,nH)*gH) / (nH-1)
-        + sqrt_pi_2 * (std::erf(aH*sqrt_1_2) - std::erf(aL*sqrt_1_2))
-      );
+        + sqrt_pi_2 * (std::erf(aL*sqrt_1_2) + std::erf(aH*sqrt_1_2))
+      ));
+      TEST(norm)
+      norm = 1./integrate(200,105,160,*this);
+      TEST(norm)
     }
-  } DSCB_params(sig,range);
+    double operator()(double x) const {
+      const double t = (x-mu)/s;
+      if (t < -aL)
+        return eL * std::pow( (rL - aL - t)/rL, -nL );
+      if (t > aH)
+        return eH * std::pow( (rH - aH + t)/rH, -nH );
+      return std::exp(-0.5*t*t);
+    }
+  } const cb(sig,range);
 
-  auto gen_sig = [ // Double-sided Crystal Ball
-    &cb = DSCB_params
-  ](double x) {
-    const double t = (x-cb.mu)/cb.s;
-    if (t < -cb.aL)
-      return cb.eL * std::pow( (cb.rL - cb.aL - t)/cb.rL, -cb.nL );
-    if (t > cb.aH)
-      return cb.eH * std::pow( (cb.rH - cb.aH + t)/cb.rH, -cb.nH );
-    return std::exp(-0.5*t*t);
+  auto gaus = [](double x){
+    return (1./std::sqrt(M_PI*2*4))*std::exp(-0.5*std::pow((x-125.)/2.,2));
   };
+  TEST(integrate(100,105,160,gaus))
 
   TEST(sig_n)
   { std::uniform_real_distribution<double>
@@ -143,7 +151,7 @@ int main(int argc, char* argv[]) {
       dist_y(0,1);
     for (size_t i=bkg_n, n=bkg_n+sig_n; i<n; ) {
       const double x = dist_x(gen);
-      if (dist_y(gen) < gen_sig(x)) { h(mc[i] = x); ++i; }
+      if (dist_y(gen) < cb(x)) { h(mc[i] = x); ++i; }
     }
   }
 
@@ -226,69 +234,82 @@ int main(int argc, char* argv[]) {
     cout << endl;
   }
 
-  auto fit_sig = [ // Normalized Double-sided Crystal Ball
-    &cb = DSCB_params
-  ](double x) {
-    const double t = (x-cb.mu)/cb.s;
-    double f;
-    if (t < -cb.aL)
-      f = cb.eL * std::pow( (cb.rL - cb.aL - t)/cb.rL, -cb.nL );
-    else if (t > cb.aH)
-      f = cb.eH * std::pow( (cb.rH - cb.aH + t)/cb.rH, -cb.nH );
-    else
-      f = std::exp(-0.5*t*t);
-    return f * cb.norm;
-  };
   auto fit_fcn = [&](double x, const double* c) {
     const double c0 = (6./330.)-(43725./330.)*c[1]-(5876750./330.)*c[2];
-    return (1.-c[0]) * (c0 + c[1]*x + c[2]*x*x) + c[0] * fit_sig(x);
+    return (1.-c[0]) * (c0 + c[1]*x + c[2]*x*x)
+              + c[0] * cb(x) * cb.norm;
   };
   std::array<double,3> fit_c;
-  { auto mLogL = make_minuit(3,
-      [&](const double* c) -> double {
-        long double logl = 0.;
-        const unsigned n = mc.size();
-        #pragma omp parallel for reduction(+:logl)
-        for (unsigned i=0; i<n; ++i) {
-          const double x = mc[i];
-          logl += std::log( fit_fcn(x,c) );
-        }
-        return -2.*logl;
+  auto mLogL = make_minuit(3,
+    [&](const double* c) -> double {
+      long double logl = 0.;
+      const unsigned n = mc.size();
+      #pragma omp parallel for reduction(+:logl)
+      for (unsigned i=0; i<n; ++i) {
+        const double x = mc[i];
+        logl += std::log( fit_fcn(x,c) );
       }
-    );
-    mLogL.SetPrintLevel(fit["verbose"]);
+      return -2.*logl;
+    }
+  );
+  mLogL.SetPrintLevel(fit["verbose"]);
+  mLogL.DefineParameter(
+    0, "sig", 0, // num, name, start
+    0.01, 0, 0 // step, min, max
+  );
+  for (unsigned i=1; i<wls_cs.size(); ++i) {
     mLogL.DefineParameter(
-      0, "sig", 0, // num, name, start
-      0.01, 0, 0 // step, min, max
+      i,
+      cat('c',i).c_str(), // name
+      wls_cs[i], // start
+      0.1, 0, 0 // step, min, max
     );
-    for (unsigned i=1; i<wls_cs.size(); ++i) {
-      mLogL.DefineParameter(
-        i,
-        cat('c',i).c_str(), // name
-        wls_cs[i], // start
-        0.1, 0, 0 // step, min, max
-      );
-    }
-    // mLogL.FixParameter(0);
-    mLogL.Migrad();
-
-    cout << "\nLikelihood fit (signal + background):\n";
-    for (unsigned i=0, n=mLogL.GetNumPars(); i<n; ++i) {
-      double val, err;
-      mLogL.GetParameter(i,val,err);
-      fit_c[i] = val;
-      cout << val << " +- " << err << '\n';
-    }
-    cout << endl;
   }
+  // mLogL.FixParameter(0);
+  mLogL.Migrad();
+
+  cout << "\nLikelihood fit (signal + background):\n";
+  for (unsigned i=0, n=mLogL.GetNumPars(); i<n; ++i) {
+    double val, err;
+    mLogL.GetParameter(i,val,err);
+    fit_c[i] = val;
+    cout << val << " +- " << err << '\n';
+  }
+  cout << endl;
 
   // Save output ====================================================
   TFile fout("toy_test.root","recreate");
-  to_root("first_toy",h);
 
   mkfcn("gen_bkg",[&](double* x, double*){ return gen_bkg(*x); });
-  mkfcn("gen_sig",[&](double* x, double*){ return gen_sig(*x); });
+  mkfcn("gen_sig",[&](double* x, double*){ return cb(*x); });
+
+  to_root("first_toy",h);
+
   mkfcn("fit",[&](double* x, double* p){ return fit_fcn(*x,p); },fit_c);
+
+  boost::optional<std::tuple<unsigned,double,double>> scan = fit["scan"];
+  if (scan) {
+    cout << "Yield likelihood scan "
+      << get<0>(*scan) << ": " << get<1>(*scan) <<' '<< get<2>(*scan) << endl;
+    TH1D* h_logl = new TH1D(
+      "logL scan","Yield likelihood scan;Signal fraction;-2logL",
+      get<0>(*scan), get<1>(*scan), get<2>(*scan));
+    const double step = (get<2>(*scan)-get<1>(*scan))/get<0>(*scan);
+    const double start = get<1>(*scan) + 0.5*step;
+    double ignore;
+    for (ivanp::timed_counter<int> i(100); !!i; ++i) {
+      mLogL.SetPrintLevel(-1);
+      mLogL.DefineParameter(
+        0, "sig", step**i+start, // num, name, start
+        0, 0, 0 // step, min, max
+      );
+      mLogL.FixParameter(0);
+      mLogL.Migrad();
+      for (unsigned i=0; i<fit_c.size(); ++i)
+        mLogL.GetParameter(i,fit_c[i],ignore);
+      h_logl->SetBinContent(i+1,mLogL.f(fit_c.data()));
+    }
+  }
 
   fout.Write();
 }

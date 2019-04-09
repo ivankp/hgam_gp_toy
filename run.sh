@@ -22,7 +22,8 @@
   "fit": {
     "verbose": 1,
     "exp": false,
-    "nbins": 55
+    "nbins": 55,
+    "scan": [ 100, -0.01, 0.02 ]
   }
 }
 CARD
