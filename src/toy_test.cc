@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <cmath>
 
 #include <nlohmann/json.hpp>
 
@@ -8,7 +9,6 @@
 #include <TH1.h>
 #include <TF1.h>
 
-#include "ivanp/enumerate.hh"
 #include "ivanp/time_seed.hh"
 #include "ivanp/binner.hh"
 #include "ivanp/string.hh"
@@ -19,6 +19,9 @@
 
 #define TEST(var) \
   std::cout << "\033[36m" #var "\033[0m = " << var << std::endl;
+
+constexpr double sqrt_pi_2 = std::sqrt(M_PI_2);
+constexpr double sqrt_1_2 = M_SQRT1_2;
 
 using std::cout;
 using std::endl;
@@ -42,6 +45,16 @@ TH1D* to_root(const char* name, const hist& h) {
   for (unsigned i=0; i<n; ++i)
     val[i] = bins[i];
   return _h;
+}
+
+template <typename F, size_t Np=0>
+TF1* mkfcn(const char* name, F&& f, const std::array<double,Np>& p = {}) {
+  TF1 *_f = new TF1( name, std::forward<F>(f), 105, 160, p.size() );
+  for (size_t i=0; i<p.size(); ++i)
+    _f->SetParameter(i,p[i]);
+  _f->SetNpx(1000);
+  _f->Write();
+  return _f;
 }
 
 int main(int argc, char* argv[]) {
@@ -69,7 +82,7 @@ int main(int argc, char* argv[]) {
   hist h({fit["nbins"],range[0],range[1]});
 
   // background -----------------------------------------------------
-  auto bkg_f = [ // polynomial or exp(poly)
+  auto gen_bkg = [ // polynomial or exp(poly)
     c = bkg["poly"].get<vector<double>>(),
     e = (bool) bkg["exp"]
   ](double x){
@@ -82,33 +95,45 @@ int main(int argc, char* argv[]) {
   TEST(bkg_n)
   { std::uniform_real_distribution<double>
       dist_x(range[0],range[1]),
-      dist_y(0,bkg_f(range[0]));
+      dist_y(0,gen_bkg(range[0]));
     for (size_t i=0; i<bkg_n; ) {
       const double x = dist_x(gen);
-      if (dist_y(gen) < bkg_f(x)) { h(mc[i] = x); ++i; }
+      if (dist_y(gen) < gen_bkg(x)) { h(mc[i] = x); ++i; }
     }
   }
 
   // signal ---------------------------------------------------------
-  auto sig_f = [ // Double-sided Crystal Ball
-    muCB  = sig["muCB" ].get<double>(),
-    sCB   = sig["sCB"  ].get<double>(),
-    aLow  = sig["aLow" ].get<double>(),
-    nLow  = sig["nLow" ].get<double>(),
-    aHigh = sig["aHigh"].get<double>(),
-    nHigh = sig["nHigh"].get<double>()
+  struct DSCB_params_t {
+    double mu, s, aL, nL, rL, eL, aH, nH, rH, eH, norm;
+    DSCB_params_t(const json& sig, const std::array<double,2>& range)
+    : mu(sig.at("muCB")), s(sig.at("sCB")),
+      aL(sig.at("aLow" )), nL(sig.at("nLow" )), rL(nL/aL), eL(std::exp(-0.5*aL*aL)),
+      aH(sig.at("aHigh")), nH(sig.at("nHigh")), rH(nH/aH), eH(std::exp(-0.5*aH*aH))
+    {
+      // norm = 1. / ( // infinite tails
+      //     eL * rL / (nL-1)
+      //   + eH * rH / (nH-1)
+      //   + sqrt_pi_2 * (std::erf(aH*sqrt_1_2) - std::erf(aL*sqrt_1_2))
+      // );
+
+      const double gL = (mu-range[0])/s + rL - aL;
+      const double gH = (range[1]-mu)/s + rL - aL;
+      norm = 1. / (
+          eL * (rL - std::pow(rL/gL,nL)*gL) / (nL-1)
+        + eH * (rH - std::pow(rH/gH,nH)*gH) / (nH-1)
+        + sqrt_pi_2 * (std::erf(aH*sqrt_1_2) - std::erf(aL*sqrt_1_2))
+      );
+    }
+  } DSCB_params(sig,range);
+
+  auto gen_sig = [ // Double-sided Crystal Ball
+    &cb = DSCB_params
   ](double x) {
-    const double t = (x-muCB)/sCB;
-    if (t < -aLow) {
-      const double RLow = nLow/aLow;
-      return std::exp(-0.5*aLow*aLow)
-        * std::pow( (RLow - aLow - t)/RLow, -nLow );
-    }
-    if (t > aHigh) {
-      const double RHigh = nHigh/aHigh;
-      return std::exp(-0.5*aHigh*aHigh)
-        * std::pow( (RHigh - aHigh + t)/RHigh, -nHigh );
-    }
+    const double t = (x-cb.mu)/cb.s;
+    if (t < -cb.aL)
+      return cb.eL * std::pow( (cb.rL - cb.aL - t)/cb.rL, -cb.nL );
+    if (t > cb.aH)
+      return cb.eH * std::pow( (cb.rH - cb.aH + t)/cb.rH, -cb.nH );
     return std::exp(-0.5*t*t);
   };
 
@@ -118,7 +143,7 @@ int main(int argc, char* argv[]) {
       dist_y(0,1);
     for (size_t i=bkg_n, n=bkg_n+sig_n; i<n; ) {
       const double x = dist_x(gen);
-      if (dist_y(gen) < sig_f(x)) { h(mc[i] = x); ++i; }
+      if (dist_y(gen) < gen_sig(x)) { h(mc[i] = x); ++i; }
     }
   }
 
@@ -168,50 +193,102 @@ int main(int argc, char* argv[]) {
   }
 
   // Likelihood fit =================================================
-  auto mLogL = make_minuit(2,
-    [&](const double* c) -> double {
-      long double logl = 0.;
-      const unsigned n = mc.size();
-      #pragma omp parallel for reduction(+:logl)
-      for (unsigned i=0; i<n; ++i) {
-        const double x = mc[i];
-        const double c0 = (6./330.)-(43725./330.)*c[0]-(5876750./330.)*c[1];
-        logl += std::log(c0 + c[0]*x + c[1]*x*x);
+  { auto mLogL = make_minuit(2,
+      [&](const double* c) -> double {
+        long double logl = 0.;
+        const unsigned n = mc.size();
+        #pragma omp parallel for reduction(+:logl)
+        for (unsigned i=0; i<n; ++i) {
+          const double x = mc[i];
+          const double c0 = (6./330.)-(43725./330.)*c[0]-(5876750./330.)*c[1];
+          logl += std::log(c0 + c[0]*x + c[1]*x*x);
+        }
+        return -2.*logl;
       }
-      return -2.*logl;
-    }
-  );
-  mLogL.SetPrintLevel(fit["verbose"]);
-  for (unsigned i=1; i<wls_cs.size(); ++i) {
-    mLogL.DefineParameter(
-      i-1,
-      cat('c',i).c_str(), // name
-      wls_cs[i], // start
-      0.1, 0, 0 // step, min, max
     );
-  }
-  mLogL.Migrad();
+    mLogL.SetPrintLevel(fit["verbose"]);
+    for (unsigned i=1; i<wls_cs.size(); ++i) {
+      mLogL.DefineParameter(
+        i-1,
+        cat('c',i).c_str(), // name
+        wls_cs[i], // start
+        0.1, 0, 0 // step, min, max
+      );
+    }
+    mLogL.Migrad();
 
-  cout << "\nLikelihood fit:\n";
-  for (unsigned i=1; i<wls_cs.size(); ++i) {
-    double val, err;
-    mLogL.GetParameter(i-1,val,err);
-    cout << 'c' << i << ": " << val << " +- " << err << '\n';
+    cout << "\nLikelihood fit (background only):\n";
+    for (unsigned i=0, n=mLogL.GetNumPars(); i<n; ++i) {
+      double val, err;
+      mLogL.GetParameter(i,val,err);
+      cout << val << " +- " << err << '\n';
+    }
+    cout << endl;
   }
-  cout << endl;
+
+  auto fit_sig = [ // Normalized Double-sided Crystal Ball
+    &cb = DSCB_params
+  ](double x) {
+    const double t = (x-cb.mu)/cb.s;
+    double f;
+    if (t < -cb.aL)
+      f = cb.eL * std::pow( (cb.rL - cb.aL - t)/cb.rL, -cb.nL );
+    else if (t > cb.aH)
+      f = cb.eH * std::pow( (cb.rH - cb.aH + t)/cb.rH, -cb.nH );
+    else
+      f = std::exp(-0.5*t*t);
+    return f * cb.norm;
+  };
+  auto fit_fcn = [&](double x, const double* c) {
+    const double c0 = (6./330.)-(43725./330.)*c[1]-(5876750./330.)*c[2];
+    return (1.-c[0]) * (c0 + c[1]*x + c[2]*x*x) + c[0] * fit_sig(x);
+  };
+  std::array<double,3> fit_c;
+  { auto mLogL = make_minuit(3,
+      [&](const double* c) -> double {
+        long double logl = 0.;
+        const unsigned n = mc.size();
+        #pragma omp parallel for reduction(+:logl)
+        for (unsigned i=0; i<n; ++i) {
+          const double x = mc[i];
+          logl += std::log( fit_fcn(x,c) );
+        }
+        return -2.*logl;
+      }
+    );
+    mLogL.SetPrintLevel(fit["verbose"]);
+    mLogL.DefineParameter(
+      0, "sig", 0, // num, name, start
+      0.01, 0, 0 // step, min, max
+    );
+    for (unsigned i=1; i<wls_cs.size(); ++i) {
+      mLogL.DefineParameter(
+        i,
+        cat('c',i).c_str(), // name
+        wls_cs[i], // start
+        0.1, 0, 0 // step, min, max
+      );
+    }
+    // mLogL.FixParameter(0);
+    mLogL.Migrad();
+
+    cout << "\nLikelihood fit (signal + background):\n";
+    for (unsigned i=0, n=mLogL.GetNumPars(); i<n; ++i) {
+      double val, err;
+      mLogL.GetParameter(i,val,err);
+      fit_c[i] = val;
+      cout << val << " +- " << err << '\n';
+    }
+    cout << endl;
+  }
 
   // Save output ====================================================
   TFile fout("toy_test.root","recreate");
   to_root("first_toy",h);
 
-  TF1 *fbkg =
-   new TF1("bkg",[&](double* x, double*){ return bkg_f(*x); },105,160,0);
-  TF1 *fsig =
-   new TF1("sig",[&](double* x, double*){ return sig_f(*x); },105,160,0);
-  fbkg->SetNpx(1000);
-  fsig->SetNpx(1000);
-  fbkg->Write();
-  fsig->Write();
+  mkfcn("gen_bkg",[&](double* x, double*){ return gen_bkg(*x); });
+  mkfcn("gen_sig",[&](double* x, double*){ return gen_sig(*x); });
+  mkfcn("fit",[&](double* x, double* p){ return fit_fcn(*x,p); },fit_c);
 
   fout.Write();
 }
