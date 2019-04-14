@@ -67,10 +67,13 @@ int main(int argc, char* argv[]) {
   json in;
   std::cin >> in;
 
+  TFile fout("toy_test.root","recreate");
+
   long seed;
   try { seed = in["seed"]; }
   catch (...) { seed = time_seed(); }
   TEST(seed)
+  TNamed("seed",cat(seed).c_str()).Write();
   std::mt19937 gen(seed);
 
   const std::array<double,2> range = in["range"];
@@ -100,6 +103,7 @@ int main(int argc, char* argv[]) {
       p += c[i] * (xn *= x);
     return e ? std::exp(p) : p;
   };
+  mkfcn("gen_bkg",[&](double* x, double*){ return gen_bkg(*x); });
 
   TEST(bkg_n)
   { std::uniform_real_distribution<double>
@@ -139,11 +143,12 @@ int main(int argc, char* argv[]) {
       return std::exp(-0.5*t*t);
     }
   } const cb(sig,range);
+  mkfcn("gen_sig",[&](double* x, double*){ return cb(*x); });
 
-  auto gaus = [](double x){
-    return (1./std::sqrt(M_PI*2*4))*std::exp(-0.5*std::pow((x-125.)/2.,2));
-  };
-  TEST(integrate(100,105,160,gaus))
+  // auto gaus = [](double x){
+  //   return (1./std::sqrt(M_PI*2*4))*std::exp(-0.5*std::pow((x-125.)/2.,2));
+  // };
+  // TEST(integrate(100,105,160,gaus))
 
   TEST(sig_n)
   { std::uniform_real_distribution<double>
@@ -154,6 +159,8 @@ int main(int argc, char* argv[]) {
       if (dist_y(gen) < cb(x)) { h(mc[i] = x); ++i; }
     }
   }
+
+  to_root("mc",h);
 
   // Weighted Least Squares =========================================
   const auto& axis = h.axis();
@@ -200,16 +207,18 @@ int main(int argc, char* argv[]) {
     cout << endl;
   }
 
-  // Likelihood fit =================================================
+  // Fit without signal =============================================
+  auto fit_bkg = [&](double x, const double* c) {
+    const double c0 = (6./330.)-(43725./330.)*c[0]-(5876750./330.)*c[1];
+    return c0 + c[0]*x + c[1]*x*x;
+  };
   { auto mLogL = make_minuit(2,
       [&](const double* c) -> double {
         long double logl = 0.;
         const unsigned n = mc.size();
         #pragma omp parallel for reduction(+:logl)
         for (unsigned i=0; i<n; ++i) {
-          const double x = mc[i];
-          const double c0 = (6./330.)-(43725./330.)*c[0]-(5876750./330.)*c[1];
-          logl += std::log(c0 + c[0]*x + c[1]*x*x);
+          logl += std::log(fit_bkg(mc[i],c));
         }
         return -2.*logl;
       }
@@ -226,90 +235,87 @@ int main(int argc, char* argv[]) {
     mLogL.Migrad();
 
     cout << "\nLikelihood fit (background only):\n";
-    for (unsigned i=0, n=mLogL.GetNumPars(); i<n; ++i) {
-      double val, err;
-      mLogL.GetParameter(i,val,err);
-      cout << val << " +- " << err << '\n';
+    std::array<double,2> fit_c;
+    for (const auto& p : mLogL.pars()) {
+      fit_c[p.i] = p.val;
+      cout << p;
     }
     cout << endl;
+
+    mkfcn("fit_bkg",
+      [&](double* x, double* p){ return fit_bkg(*x,p); }, fit_c);
   }
 
-  auto fit_fcn = [&](double x, const double* c) {
-    const double c0 = (6./330.)-(43725./330.)*c[1]-(5876750./330.)*c[2];
-    return (1.-c[0]) * (c0 + c[1]*x + c[2]*x*x)
-              + c[0] * cb(x) * cb.norm;
+  // Fit with signal ================================================
+  auto fit_bkg_sig = [&](double x, const double* c) {
+    return (1.-c[0]) * fit_bkg(x,c+1) + c[0] * cb(x) * cb.norm;
   };
-  std::array<double,3> fit_c;
-  auto mLogL = make_minuit(3,
-    [&](const double* c) -> double {
-      long double logl = 0.;
-      const unsigned n = mc.size();
-      #pragma omp parallel for reduction(+:logl)
-      for (unsigned i=0; i<n; ++i) {
-        const double x = mc[i];
-        logl += std::log( fit_fcn(x,c) );
+  { auto mLogL = make_minuit(3,
+      [&](const double* c) -> double {
+        long double logl = 0.;
+        const unsigned n = mc.size();
+        #pragma omp parallel for reduction(+:logl)
+        for (unsigned i=0; i<n; ++i) {
+          logl += std::log( fit_bkg_sig(mc[i],c) );
+        }
+        return -2.*logl;
       }
-      return -2.*logl;
-    }
-  );
-  mLogL.SetPrintLevel(fit["verbose"]);
-  mLogL.DefineParameter(
-    0, "sig", 0, // num, name, start
-    0.01, 0, 0 // step, min, max
-  );
-  for (unsigned i=1; i<wls_cs.size(); ++i) {
-    mLogL.DefineParameter(
-      i,
-      cat('c',i).c_str(), // name
-      wls_cs[i], // start
-      0.1, 0, 0 // step, min, max
     );
-  }
-  // mLogL.FixParameter(0);
-  mLogL.Migrad();
-
-  cout << "\nLikelihood fit (signal + background):\n";
-  for (unsigned i=0, n=mLogL.GetNumPars(); i<n; ++i) {
-    double val, err;
-    mLogL.GetParameter(i,val,err);
-    fit_c[i] = val;
-    cout << val << " +- " << err << '\n';
-  }
-  cout << endl;
-
-  // Save output ====================================================
-  TFile fout("toy_test.root","recreate");
-
-  mkfcn("gen_bkg",[&](double* x, double*){ return gen_bkg(*x); });
-  mkfcn("gen_sig",[&](double* x, double*){ return cb(*x); });
-
-  to_root("first_toy",h);
-
-  mkfcn("fit",[&](double* x, double* p){ return fit_fcn(*x,p); },fit_c);
-
-  boost::optional<std::tuple<unsigned,double,double>> scan = fit["scan"];
-  if (scan) {
-    cout << "Yield likelihood scan "
-      << get<0>(*scan) << ": " << get<1>(*scan) <<' '<< get<2>(*scan) << endl;
-    TH1D* h_logl = new TH1D(
-      "logL scan","Yield likelihood scan;Signal fraction;-2logL",
-      get<0>(*scan), get<1>(*scan), get<2>(*scan));
-    const double step = (get<2>(*scan)-get<1>(*scan))/get<0>(*scan);
-    const double start = get<1>(*scan) + 0.5*step;
-    double ignore;
-    for (ivanp::timed_counter<int> i(100); !!i; ++i) {
-      mLogL.SetPrintLevel(-1);
+    mLogL.SetPrintLevel(fit["verbose"]);
+    mLogL.DefineParameter(
+      0, "sig", 0, // num, name, start
+      0.01, 0, 0 // step, min, max
+    );
+    for (unsigned i=1; i<wls_cs.size(); ++i) {
       mLogL.DefineParameter(
-        0, "sig", step**i+start, // num, name, start
-        0, 0, 0 // step, min, max
+        i,
+        cat('c',i).c_str(), // name
+        wls_cs[i], // start
+        0.1, 0, 0 // step, min, max
       );
-      mLogL.FixParameter(0);
-      mLogL.Migrad();
-      for (unsigned i=0; i<fit_c.size(); ++i)
-        mLogL.GetParameter(i,fit_c[i],ignore);
-      h_logl->SetBinContent(i+1,mLogL.f(fit_c.data()));
     }
+    // mLogL.FixParameter(0);
+    mLogL.Migrad();
+
+    cout << "\nLikelihood fit (signal + background):\n";
+    std::array<double,3> fit_c;
+    for (const auto& p : mLogL.pars()) {
+      fit_c[p.i] = p.val;
+      cout << p;
+    }
+    cout << endl;
+
+    mkfcn("fit_bkg_sig",
+      [&](double* x, double* p){ return fit_bkg_sig(*x,p); }, fit_c);
+
+    // Likelihood scan ----------------------------------------------
+    boost::optional<std::tuple<unsigned,double,double>> scan = fit["scan"];
+    if (scan) {
+      cout << "Yield likelihood scan "
+        << get<0>(*scan) << ": " << get<1>(*scan) <<' '<< get<2>(*scan) << endl;
+      TH1D* h_logl = new TH1D(
+        "logL scan","Yield likelihood scan;Signal fraction;-2logL",
+        get<0>(*scan), get<1>(*scan), get<2>(*scan));
+      const double step = (get<2>(*scan)-get<1>(*scan))/get<0>(*scan);
+      const double start = get<1>(*scan) + 0.5*step;
+      double ignore;
+      for (timed_counter<int> i(100); !!i; ++i) {
+        mLogL.SetPrintLevel(-1);
+        mLogL.DefineParameter(
+          0, "sig", step**i+start, // num, name, start
+          0, 0, 0 // step, min, max
+        );
+        mLogL.FixParameter(0);
+        mLogL.Migrad();
+        for (unsigned i=0; i<fit_c.size(); ++i)
+          mLogL.GetParameter(i,fit_c[i],ignore);
+        h_logl->SetBinContent(i+1,mLogL.f(fit_c.data()));
+      }
+    }
+
   }
+
+  // Fit with GP ====================================================
 
   fout.Write();
 }
