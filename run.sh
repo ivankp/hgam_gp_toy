@@ -23,7 +23,8 @@
     "verbose": 1,
     "exp": false,
     "nbins": 55,
-    "scan": [ 100, -0.01, 0.02 ]
+    "scan": [ 0, -0.01, 0.02 ],
+    "gp": true
   }
 }
 CARD

@@ -35,6 +35,7 @@ using std::string;
 using std::vector;
 using nlohmann::json;
 using namespace ivanp;
+using linalg::sq;
 
 template <typename T>
 const T& cref(const json& j) { return j.get_ref<const T&>(); }
@@ -84,7 +85,9 @@ int main(int argc, char* argv[]) {
   const auto& sig = in["sig"];
   const size_t sig_n = sig["n"];
 
-  const double sig_frac = double(sig_n)/double(bkg_n+sig_n);
+  const size_t tot_n = bkg_n + sig_n;
+  const double sig_frac = double(sig_n)/double(tot_n);
+  TEST(tot_n)
   TEST(sig_frac)
 
   const auto& fit = in["fit"];
@@ -162,50 +165,55 @@ int main(int argc, char* argv[]) {
 
   to_root("mc",h);
 
-  // Weighted Least Squares =========================================
   const auto& axis = h.axis();
   const auto nbins = axis.nbins();
+  vector<double> bin_centers(nbins);
+  { double a = axis.edge(0), b;
+    for (unsigned i=0; i<nbins; ) {
+      ++i;
+      b = axis.edge(i);
+      bin_centers[i-1] = a + (b-a)/2;
+      a = b;
+    }
+  }
+
+  // Weighted Least Squares =========================================
   constexpr size_t nfs = 3;
   std::array<double,nfs> wls_cs;
-  {
-    std::vector<double> A;
-    A.reserve(nfs*nbins);
-    for (auto& f : { // unary + decays lambdas to function pointers
-      +[](double x){ return 1.;  },
-      +[](double x){ return x;   },
-      +[](double x){ return x*x; }
-    }) {
-      double a = axis.edge(0), b;
-      for (unsigned i=0; i<nbins; ) {
-        ++i;
-        b = axis.edge(i);
-        A.push_back(f(a+(b-a)/2));
-        a = b;
-      }
-    }
-    std::vector<double> us;
-    us.reserve(nbins);
-    for (double y : h) us.push_back(y==0 ? 1 : y);
 
-    wls(
-      A.data(),
-      h.bins().data(), // observed values
-      us.data(), // variances
-      nbins, // number of values
-      nfs, // number of parameters
-      wls_cs.data() // fit coefficients
-    );
-    cout << "WLS:\n";
-    for (auto c : wls_cs) cout << ' ' << c;
-    cout << "\nNormalized coefficients:\n";
-    const double norm = 1./(
-        55.*wls_cs[0]
-      + (14575./2.)*wls_cs[1]
-      + (2938375./3.)*wls_cs[2]
-    );
-    for (auto& c : wls_cs) cout << ' ' << (c*=norm);
-    cout << endl;
+  std::vector<double> A;
+  A.reserve(nfs*nbins);
+  for (auto& f : { // unary + decays lambdas to function pointers
+    +[](double x){ return 1.;  },
+    +[](double x){ return x;   },
+    +[](double x){ return x*x; }
+  }) {
+    for (unsigned i=0; i<nbins; ++i)
+      A.push_back(f(bin_centers[i]));
   }
+
+  std::vector<double> us; // bin variances
+  us.reserve(nbins);
+  for (double y : h) us.push_back(y==0 ? 1 : y);
+
+  wls(
+    A.data(),
+    h.bins().data(), // observed values
+    us.data(), // variances
+    nbins, // number of values
+    nfs, // number of parameters
+    wls_cs.data() // fit coefficients
+  );
+  cout << "WLS:\n";
+  for (auto c : wls_cs) cout << ' ' << c;
+  cout << "\nNormalized coefficients:\n";
+  const double norm = 1./(
+      55.*wls_cs[0]
+    + (14575./2.)*wls_cs[1]
+    + (2938375./3.)*wls_cs[2]
+  );
+  for (auto& c : wls_cs) cout << ' ' << (c*=norm);
+  cout << endl;
 
   // Fit without signal =============================================
   auto fit_bkg = [&](double x, const double* c) {
@@ -284,22 +292,25 @@ int main(int argc, char* argv[]) {
       cout << p;
     }
     cout << endl;
+    TEST(sig_frac)
+    cout << endl;
 
     mkfcn("fit_bkg_sig",
       [&](double* x, double* p){ return fit_bkg_sig(*x,p); }, fit_c);
 
     // Likelihood scan ----------------------------------------------
     boost::optional<std::tuple<unsigned,double,double>> scan = fit["scan"];
-    if (scan) {
+    if (scan && get<0>(*scan)!=0) {
       cout << "Yield likelihood scan "
-        << get<0>(*scan) << ": " << get<1>(*scan) <<' '<< get<2>(*scan) << endl;
+        << get<0>(*scan) <<": "<< get<1>(*scan) <<' '<< get<2>(*scan) << endl;
       TH1D* h_logl = new TH1D(
         "logL scan","Yield likelihood scan;Signal fraction;-2logL",
         get<0>(*scan), get<1>(*scan), get<2>(*scan));
       const double step = (get<2>(*scan)-get<1>(*scan))/get<0>(*scan);
       const double start = get<1>(*scan) + 0.5*step;
       double ignore;
-      for (timed_counter<int> i(100); !!i; ++i) {
+      std::array<double,3> fit_c;
+      for (timed_counter<int> i(get<0>(*scan)); !!i; ++i) {
         mLogL.SetPrintLevel(-1);
         mLogL.DefineParameter(
           0, "sig", step**i+start, // num, name, start
@@ -312,10 +323,103 @@ int main(int argc, char* argv[]) {
         h_logl->SetBinContent(i+1,mLogL.f(fit_c.data()));
       }
     }
+    cout << endl;
+
+    { hist h_fit(axis), h_diff(axis);
+      auto& b_fit  = h_fit .bins();
+      auto& b_diff = h_diff.bins();
+      double a = axis.edge(0), b;
+      for (unsigned i=0; i<nbins; ) {
+        ++i;
+        b = axis.edge(i);
+        b_diff[i-1] = h[{i-1}] - (
+          b_fit[i-1] = tot_n*integrate(10,a,b,
+            [&,c=fit_c.data()](double x){ return fit_bkg_sig(x,c); })
+        );
+        a = b;
+      }
+      to_root("binned_fit",h_fit);
+      to_root("binned_diff",h_diff);
+    }
 
   }
 
   // Fit with GP ====================================================
+  if (fit["gp"].get<bool>()) {
+    vector<double> gp_ys(nbins);
+    const auto& bins = h.bins();
+    // size_t call = 0;
+    auto mLogL = make_minuit(5,
+      [&](const double* c) -> double {
+        long double logl = 0.;
+        const unsigned n = mc.size();
+        #pragma omp parallel for reduction(+:logl)
+        for (unsigned i=0; i<n; ++i) {
+          logl += std::log( fit_bkg_sig(mc[i],c) );
+        }
+
+        double a = axis.edge(0), b;
+        for (unsigned i=0; i<nbins; ) {
+          ++i;
+          b = axis.edge(i);
+          gp_ys[i-1] = bins[i-1] - tot_n*integrate(10,a,b,
+            [&](double x){ return fit_bkg_sig(x,c); });
+          a = b;
+        }
+
+        // TEST((++call))
+        return -2.*(logl - gp_logml_opt(bin_centers, gp_ys, us,
+          [](auto a, auto b, double s, double l){
+            return s * std::exp(-0.5*sq((a-b)/l));
+          }, c[3], c[4]));
+      }
+    );
+    mLogL.SetPrintLevel(fit["verbose"]);
+    mLogL.DefineParameter(
+      0, "sig", 0, // num, name, start
+      0.01, 0, 0 // step, min, max
+    );
+    for (unsigned i=1; i<wls_cs.size(); ++i) {
+      mLogL.DefineParameter(
+        i,
+        cat('c',i).c_str(), // name
+        wls_cs[i], // start
+        0.1, 0, 0 // step, min, max
+      );
+    }
+    mLogL.DefineParameter(
+      3, "gp_s", 1, // num, name, start
+      0.1, 0.01, 10000 // step, min, max
+    );
+    mLogL.DefineParameter(
+      4, "gp_l", 1, // num, name, start
+      0.1, 0.1, 100 // step, min, max
+    );
+    // mLogL.FixParameter(0);
+    mLogL.Migrad();
+
+    cout << "\nLikelihood fit (signal + background):\n";
+    std::array<double,3> fit_c;
+    for (const auto& p : mLogL.pars()) {
+      if (p.i<fit_c.size()) fit_c[p.i] = p.val;
+      cout << p;
+    }
+    cout << endl;
+    TEST(sig_frac)
+    cout << endl;
+
+    mkfcn("fit_bkg_sig_gp",
+      [&](double* x, double* p){ return fit_bkg_sig(*x,p); }, fit_c);
+
+    // const auto gp = GP(xs,ys,us,
+    //   generator(0,nt,[a=xs.front(),s=(xs.back()-xs.front())/(nt-1)](auto i){
+    //     return a + s*i;
+    //   }),
+    //   [](auto a, auto b){
+    //     return std::exp((-0.5/sq(2))*sq(a-b));
+    //   }
+    // );
+  }
 
   fout.Write();
 }
