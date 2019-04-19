@@ -1,8 +1,9 @@
 #!/bin/bash
 
-./bin/toy_test << CARD
+./bin/test_fit << CARD
 {
   "seed": null,
+  "output": "test_fit.root",
   "range": [ 105, 160 ],
   "bkg": {
     "exp": true,

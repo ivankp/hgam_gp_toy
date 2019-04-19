@@ -31,10 +31,16 @@ all: $(EXES)
 
 # -------------------------------------------------------------------
 bin/poly_coords: linalg.o
-bin/toy_test: linalg.o wls.o
+bin/test_fit: linalg.o wls.o
+bin/unbinned: linalg.o
+bin/toy_conventional: linalg.o wls.o
 
-C_toy_test := -fopenmp $(ROOT_CXXFLAGS)
-L_toy_test := -fopenmp $(ROOT_LDLIBS) -lMinuit
+C_test_fit := -fopenmp $(ROOT_CXXFLAGS)
+L_test_fit := -fopenmp $(ROOT_LDLIBS) -lMinuit
+C_unbinned := -fopenmp $(ROOT_CXXFLAGS)
+L_unbinned := -fopenmp $(ROOT_LDLIBS) -lgsl -lgslcblas
+C_toy_conventional := -fopenmp $(ROOT_CXXFLAGS)
+L_toy_conventional := -fopenmp $(ROOT_LDLIBS) -lMinuit
 # -------------------------------------------------------------------
 
 $(DEPS): $(BLD)/%.d: src/%$(EXT)

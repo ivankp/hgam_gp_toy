@@ -40,6 +40,10 @@ using linalg::sq;
 template <typename T>
 const T& cref(const json& j) { return j.get_ref<const T&>(); }
 
+const char* cstr(const json& j) {
+  return j.get_ptr<const json::string_t*>()->c_str();
+}
+
 using hist = binner<double,
   std::tuple<axis_spec<uniform_axis<double>,0,0>> >;
 
@@ -68,7 +72,7 @@ int main(int argc, char* argv[]) {
   json in;
   std::cin >> in;
 
-  TFile fout("toy_test.root","recreate");
+  TFile fout(cstr(in["output"]),"recreate");
 
   long seed;
   try { seed = in["seed"]; }
